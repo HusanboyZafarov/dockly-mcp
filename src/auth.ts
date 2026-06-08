@@ -10,12 +10,6 @@ export function isAuthEnabled(): boolean {
 
 // ── Types ─────────────────────────────────────────────────────────────────
 
-interface RegisteredClient {
-  client_id: string;
-  client_name?: string;
-  redirect_uris: string[];
-}
-
 interface PendingAuth {
   clientId: string;
   redirectUri: string;
@@ -48,7 +42,6 @@ interface AccessToken {
 
 // ── In-memory stores ──────────────────────────────────────────────────────
 
-const registeredClients = new Map<string, RegisteredClient>();
 const pendingAuths = new Map<string, PendingAuth>();
 const authCodes = new Map<string, AuthCode>();
 const accessTokens = new Map<string, AccessToken>();
@@ -76,20 +69,30 @@ export function getOAuthMetadata() {
   };
 }
 
-// ── Dynamic Client Registration ───────────────────────────────────────────
+// ── Dynamic Client Registration (RFC 7591) ────────────────────────────────
 
 export function registerClient(body: {
   client_name?: string;
-  redirect_uris: string[];
-}): RegisteredClient {
+  redirect_uris?: string[];
+  grant_types?: string[];
+  response_types?: string[];
+  token_endpoint_auth_method?: string;
+}) {
   const client_id = crypto.randomUUID();
-  const client: RegisteredClient = {
+  const now = Math.floor(Date.now() / 1000);
+
+  const response = {
     client_id,
-    client_name: body.client_name,
-    redirect_uris: body.redirect_uris,
+    client_name: body.client_name || "mcp-client",
+    redirect_uris: body.redirect_uris || [],
+    grant_types: body.grant_types || ["authorization_code"],
+    response_types: body.response_types || ["code"],
+    token_endpoint_auth_method: body.token_endpoint_auth_method || "none",
+    client_id_issued_at: now,
   };
-  registeredClients.set(client_id, client);
-  return client;
+
+  console.log(`[AUTH] Client registered: ${client_id} (${response.client_name})`);
+  return response;
 }
 
 // ── Authorization → redirect to GitHub ────────────────────────────────────
@@ -111,6 +114,8 @@ export function buildGitHubAuthUrl(params: {
     state: params.state,
   });
 
+  console.log(`[AUTH] Authorize request: client=${params.clientId}, redirect_uri=${params.redirectUri}`);
+
   // Auto-expire pending auths after 10 minutes
   setTimeout(() => pendingAuths.delete(githubState), 10 * 60 * 1000);
 
@@ -130,10 +135,14 @@ export async function handleGitHubCallback(
   githubState: string
 ): Promise<{ redirectUrl: string } | null> {
   const pending = pendingAuths.get(githubState);
-  if (!pending) return null;
+  if (!pending) {
+    console.error("[AUTH] Callback failed: no pending auth for state", githubState);
+    return null;
+  }
   pendingAuths.delete(githubState);
 
   // Exchange GitHub code for access token
+  console.log("[AUTH] Exchanging GitHub code for token...");
   const tokenRes = await fetch("https://github.com/login/oauth/access_token", {
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "application/json" },
@@ -147,8 +156,13 @@ export async function handleGitHubCallback(
   const tokenData = (await tokenRes.json()) as {
     access_token?: string;
     error?: string;
+    error_description?: string;
   };
-  if (!tokenData.access_token) return null;
+
+  if (!tokenData.access_token) {
+    console.error("[AUTH] GitHub token exchange failed:", tokenData.error, tokenData.error_description);
+    return null;
+  }
 
   // Fetch GitHub user profile
   const userRes = await fetch("https://api.github.com/user", {
@@ -157,7 +171,12 @@ export async function handleGitHubCallback(
       "User-Agent": "dockly-mcp",
     },
   });
-  if (!userRes.ok) return null;
+
+  if (!userRes.ok) {
+    console.error("[AUTH] GitHub user fetch failed:", userRes.status);
+    return null;
+  }
+
   const githubUser = (await userRes.json()) as GitHubUser;
 
   // Generate a short-lived auth code for the MCP client
@@ -173,14 +192,13 @@ export async function handleGitHubCallback(
   // Auto-expire
   setTimeout(() => authCodes.delete(authCode), 10 * 60 * 1000);
 
-  // Redirect back to the MCP client's redirect_uri
-  const redirectUrl = new URL(pending.redirectUri);
-  redirectUrl.searchParams.set("code", authCode);
-  redirectUrl.searchParams.set("state", pending.state);
+  // Build redirect back to the MCP client
+  const separator = pending.redirectUri.includes("?") ? "&" : "?";
+  const redirectUrl = `${pending.redirectUri}${separator}code=${encodeURIComponent(authCode)}&state=${encodeURIComponent(pending.state)}`;
 
-  console.log(`[AUTH] GitHub user "${githubUser.login}" authenticated`);
+  console.log(`[AUTH] GitHub user "${githubUser.login}" authenticated, redirecting to client`);
 
-  return { redirectUrl: redirectUrl.toString() };
+  return { redirectUrl };
 }
 
 // ── Token Exchange (with PKCE verification) ───────────────────────────────
@@ -189,18 +207,25 @@ export function exchangeCodeForToken(params: {
   code: string;
   codeVerifier: string;
   clientId: string;
-  redirectUri: string;
-}): { access_token: string; token_type: string } | { error: string } {
+  redirectUri?: string;
+}): { access_token: string; token_type: string; expires_in: number } | { error: string; error_description?: string } {
   const stored = authCodes.get(params.code);
-  if (!stored) return { error: "invalid_grant" };
+
+  if (!stored) {
+    console.error("[AUTH] Token exchange failed: invalid or expired code");
+    return { error: "invalid_grant", error_description: "Authorization code not found or expired" };
+  }
 
   if (stored.expiresAt < Date.now()) {
     authCodes.delete(params.code);
-    return { error: "invalid_grant" };
+    console.error("[AUTH] Token exchange failed: code expired");
+    return { error: "invalid_grant", error_description: "Authorization code expired" };
   }
 
-  if (stored.clientId !== params.clientId) return { error: "invalid_client" };
-  if (stored.redirectUri !== params.redirectUri) return { error: "invalid_grant" };
+  if (stored.clientId !== params.clientId) {
+    console.error(`[AUTH] Token exchange failed: client_id mismatch (expected ${stored.clientId}, got ${params.clientId})`);
+    return { error: "invalid_client", error_description: "Client ID mismatch" };
+  }
 
   // Verify PKCE: SHA256(code_verifier) must match stored code_challenge
   const hash = crypto
@@ -208,7 +233,10 @@ export function exchangeCodeForToken(params: {
     .update(params.codeVerifier)
     .digest("base64url");
 
-  if (hash !== stored.codeChallenge) return { error: "invalid_grant" };
+  if (hash !== stored.codeChallenge) {
+    console.error("[AUTH] Token exchange failed: PKCE verification failed");
+    return { error: "invalid_grant", error_description: "PKCE verification failed" };
+  }
 
   // Issue access token
   const token = crypto.randomUUID();
@@ -223,7 +251,11 @@ export function exchangeCodeForToken(params: {
 
   console.log(`[AUTH] Token issued for "${stored.githubUser.login}"`);
 
-  return { access_token: token, token_type: "Bearer" };
+  return {
+    access_token: token,
+    token_type: "bearer",
+    expires_in: 3600 * 24 * 7, // 7 days
+  };
 }
 
 // ── Token Validation ──────────────────────────────────────────────────────

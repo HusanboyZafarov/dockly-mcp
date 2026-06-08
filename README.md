@@ -1,8 +1,10 @@
-# API Docs MCP Server
+# Dockly MCP
 
 An MCP (Model Context Protocol) server that fetches, parses, and exposes API documentation for AI assistants. Paste a Postman Collection or OpenAPI spec URL and any AI can explore, search, and test your APIs.
 
 **Live Server:** `https://dockly-mcp.up.railway.app/sse`
+
+**Auth:** GitHub OAuth 2.1 (MCP spec-compliant)
 
 ## Supported Formats
 
@@ -30,23 +32,32 @@ An MCP (Model Context Protocol) server that fetches, parses, and exposes API doc
 
 ### Use the hosted version (no setup needed)
 
-Add to your MCP client config:
+Add to your MCP client config (`.mcp.json`, Claude Desktop config, etc.):
 
 ```json
 {
   "mcpServers": {
-    "api-docs": {
+    "dockly": {
+      "type": "sse",
       "url": "https://dockly-mcp.up.railway.app/sse"
     }
   }
 }
 ```
 
+Or via Claude Code CLI:
+
+```bash
+claude mcp add dockly --transport sse https://dockly-mcp.up.railway.app/sse
+```
+
+On first connect, your MCP client will open a browser for GitHub login. Authorize once and you're in.
+
 ### Run locally (stdio mode)
 
 ```bash
-git clone https://github.com/HusanboyZafarov/api-docs-mcp-server.git
-cd api-docs-mcp-server
+git clone https://github.com/HusanboyZafarov/dockly-mcp.git
+cd dockly-mcp
 npm install
 npm run build
 ```
@@ -56,13 +67,15 @@ Add to your MCP config:
 ```json
 {
   "mcpServers": {
-    "api-docs": {
+    "dockly": {
       "command": "node",
-      "args": ["/path/to/api-docs-mcp-server/dist/index.js"]
+      "args": ["/path/to/dockly-mcp/dist/index.js"]
     }
   }
 }
 ```
+
+> Stdio mode has no auth — it runs locally on your machine.
 
 ### Run locally (HTTP/SSE mode)
 
@@ -71,6 +84,34 @@ npm run start:http
 # Server runs at http://localhost:3100
 # SSE endpoint: http://localhost:3100/sse
 ```
+
+> Auth is disabled by default in local mode. Set the env vars below to enable it.
+
+## Authentication
+
+Dockly uses **OAuth 2.1 with GitHub** login, fully compliant with the [MCP authorization spec](https://modelcontextprotocol.io/specification/2025-03-26/basic/authorization).
+
+**How it works:**
+
+1. MCP client connects to `/sse`
+2. Server returns `401` with OAuth metadata
+3. Client auto-opens browser -> user logs in with GitHub
+4. Done — no API keys, no tokens to copy
+
+**To enable auth on your own deployment:**
+
+1. Create a [GitHub OAuth App](https://github.com/settings/developers):
+   - **Homepage URL:** your server URL
+   - **Callback URL:** `https://your-domain.com/callback`
+
+2. Set environment variables:
+   ```
+   GITHUB_CLIENT_ID=your_client_id
+   GITHUB_CLIENT_SECRET=your_client_secret
+   BASE_URL=https://your-domain.com
+   ```
+
+If `GITHUB_CLIENT_ID` is not set, auth is disabled and the server runs open (good for local dev).
 
 ## Usage Example
 
@@ -85,8 +126,8 @@ Once connected, any AI assistant can:
 
 ## Compatible MCP Clients
 
-- Claude Desktop
 - Claude Code (CLI)
+- Claude Desktop
 - Cursor
 - Windsurf
 - Any MCP-compatible AI client
@@ -96,8 +137,12 @@ Once connected, any AI assistant can:
 ### Docker
 
 ```bash
-docker build -t api-docs-mcp .
-docker run -p 3100:3100 api-docs-mcp
+docker build -t dockly-mcp .
+docker run -p 3100:3100 \
+  -e GITHUB_CLIENT_ID=xxx \
+  -e GITHUB_CLIENT_SECRET=xxx \
+  -e BASE_URL=https://your-domain.com \
+  dockly-mcp
 ```
 
 ### Railway
@@ -110,18 +155,21 @@ railway up
 railway domain
 ```
 
+Set `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, and `BASE_URL` in Railway variables.
+
 ### Render
 
 1. Connect your GitHub repo on render.com
 2. Build Command: `npm ci && npm run build`
 3. Start Command: `npm run start:http`
-4. Environment: `PORT=3100`
+4. Environment: `PORT=3100`, `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, `BASE_URL`
 
 ## Tech Stack
 
 - TypeScript + Node.js
 - [@modelcontextprotocol/sdk](https://github.com/modelcontextprotocol/typescript-sdk)
 - Express (HTTP/SSE transport)
+- GitHub OAuth 2.1 with PKCE
 - js-yaml (YAML parsing)
 - Zod (schema validation)
 

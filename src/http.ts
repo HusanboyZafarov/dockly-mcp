@@ -39,12 +39,8 @@ app.get("/.well-known/oauth-authorization-server", (_req, res) => {
 // ── Dynamic Client Registration ──────────────────────────────────────────
 
 app.post("/register", (req, res) => {
-  const { client_name, redirect_uris } = req.body;
-  if (!redirect_uris || !Array.isArray(redirect_uris)) {
-    res.status(400).json({ error: "redirect_uris is required" });
-    return;
-  }
-  const client = registerClient({ client_name, redirect_uris });
+  console.log("[AUTH] Registration request:", JSON.stringify(req.body));
+  const client = registerClient(req.body || {});
   res.status(201).json(client);
 });
 
@@ -112,13 +108,15 @@ app.get("/callback", async (req, res) => {
 app.post("/token", (req, res) => {
   const { grant_type, code, code_verifier, client_id, redirect_uri } = req.body;
 
+  console.log("[AUTH] Token request:", { grant_type, code: code ? "***" : undefined, client_id, redirect_uri });
+
   if (grant_type !== "authorization_code") {
     res.status(400).json({ error: "unsupported_grant_type" });
     return;
   }
 
-  if (!code || !code_verifier || !client_id || !redirect_uri) {
-    res.status(400).json({ error: "invalid_request" });
+  if (!code || !code_verifier || !client_id) {
+    res.status(400).json({ error: "invalid_request", error_description: "Missing code, code_verifier, or client_id" });
     return;
   }
 
