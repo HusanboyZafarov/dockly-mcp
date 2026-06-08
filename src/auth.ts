@@ -1,6 +1,6 @@
 import crypto from "crypto";
 
-const BASE_URL = process.env.BASE_URL || "https://pretty-analysis-production-b53e.up.railway.app";
+const BASE_URL = process.env.BASE_URL || "https://dockly-mcp.up.railway.app";
 const GITHUB_CLIENT_ID = process.env.GITHUB_CLIENT_ID ?? "";
 const GITHUB_CLIENT_SECRET = process.env.GITHUB_CLIENT_SECRET ?? "";
 

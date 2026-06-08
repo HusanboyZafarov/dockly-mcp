@@ -21,7 +21,7 @@ app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-const BASE_URL = process.env.BASE_URL || "https://pretty-analysis-production-b53e.up.railway.app";
+const BASE_URL = process.env.BASE_URL || "https://dockly-mcp.up.railway.app";
 
 // Track active sessions: sessionId -> transport
 const sessions = new Map<string, SSEServerTransport>();
