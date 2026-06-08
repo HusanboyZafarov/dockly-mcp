@@ -2,7 +2,7 @@
 
 An MCP (Model Context Protocol) server that fetches, parses, and exposes API documentation for AI assistants. Paste a Postman Collection or OpenAPI spec URL and any AI can explore, search, and test your APIs.
 
-**Live Server:** `https://pretty-analysis-production-b53e.up.railway.app/sse`
+**Live Server:** `https://dockly-mcp.up.railway.app/sse`
 
 ## Supported Formats
 
@@ -36,7 +36,7 @@ Add to your MCP client config:
 {
   "mcpServers": {
     "api-docs": {
-      "url": "https://pretty-analysis-production-b53e.up.railway.app/sse"
+      "url": "https://dockly-mcp.up.railway.app/sse"
     }
   }
 }
