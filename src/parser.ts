@@ -10,6 +10,7 @@ import type {
   PostmanBody,
   PostmanResponse,
   PostmanRequestDetail,
+  PostmanUrl,
   FlatEndpoint,
 } from "./types.js";
 import { isOpenApiSpec, isRequestItem } from "./types.js";
@@ -249,9 +250,13 @@ export function openApiToPostmanCollection(
 // ── Normalize Postman items ──────────────────────────────────────────────
 
 function normalizePostmanItems(items: (PostmanFolder | PostmanRequestItem)[]) {
+  if (!items || !Array.isArray(items)) return;
+
   for (const item of items) {
     if ("request" in item) {
       const req = item.request;
+
+      // Normalize URL: could be string, object, or missing
       const rawUrl = req.url as unknown;
       if (typeof rawUrl === "string") {
         (req as unknown as Record<string, unknown>).url = {
@@ -259,7 +264,20 @@ function normalizePostmanItems(items: (PostmanFolder | PostmanRequestItem)[]) {
           host: [],
           path: rawUrl.split("/").filter(Boolean),
         };
+      } else if (!rawUrl) {
+        (req as unknown as Record<string, unknown>).url = {
+          raw: "",
+          host: [],
+          path: [],
+        };
       }
+
+      // Ensure header is always an array
+      if (!req.header) {
+        (req as unknown as Record<string, unknown>).header = [];
+      }
+
+      // Ensure response is always an array
       if (!item.response) {
         (item as unknown as Record<string, unknown>).response = [];
       }
@@ -293,8 +311,13 @@ export function parseContent(
       "info" in (data as object) &&
       "item" in (data as object)
     ) {
-      normalizePostmanItems((data as PostmanCollection).item);
-      return data as PostmanCollection;
+      const collection = data as PostmanCollection;
+      // Ensure variable is always an array
+      if (!collection.variable) {
+        collection.variable = [];
+      }
+      normalizePostmanItems(collection.item);
+      return collection;
     }
 
     return null;
@@ -315,17 +338,45 @@ export function flattenCollection(
   for (const item of items) {
     if (isRequestItem(item)) {
       const id = [...folderPath, item.name].join("/");
+
+      // Safely get URL — could be string, object, or missing
+      const urlField = item.request.url;
+      const rawUrl = typeof urlField === "string"
+        ? urlField
+        : urlField?.raw ?? "";
+
+      // Extract query params from Postman URL object or raw URL
+      const queryParams: { key: string; value: string; description?: string }[] = [];
+      if (urlField && typeof urlField === "object") {
+        const urlObj = urlField as PostmanUrl & { query?: { key: string; value: string; description?: string }[] };
+        if (urlObj.query && Array.isArray(urlObj.query)) {
+          for (const q of urlObj.query) {
+            queryParams.push({ key: q.key, value: q.value ?? "", description: q.description });
+          }
+        }
+      }
+      if (queryParams.length === 0 && rawUrl.includes("?")) {
+        const qIdx = rawUrl.indexOf("?");
+        const qs = rawUrl.slice(qIdx + 1);
+        for (const pair of qs.split("&")) {
+          const [key, ...rest] = pair.split("=");
+          if (key) queryParams.push({ key, value: rest.join("=") || "" });
+        }
+      }
+
       result.push({
         id,
         folder: folderPath.join("/"),
         name: item.name,
         method: item.request.method,
-        url: item.request.url.raw,
+        url: rawUrl,
         description: item.request.description,
-        headers: item.request.header,
+        headers: item.request.header ?? [],
         body: item.request.body?.raw,
+        bodyObj: item.request.body,
         parameters: item.request.parameters,
-        responses: item.response,
+        queryParams: queryParams.length > 0 ? queryParams : undefined,
+        responses: item.response ?? [],
       });
     } else {
       const folder = item as PostmanFolder;

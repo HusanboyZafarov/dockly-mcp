@@ -1,8 +1,16 @@
 // ── Postman types ─────────────────────────────────────────────────────────
 
+export interface PostmanAuth {
+  type: string; // "bearer", "basic", "apikey", etc.
+  bearer?: { key: string; value: string; type?: string }[];
+  basic?: { key: string; value: string; type?: string }[];
+  apikey?: { key: string; value: string; type?: string }[];
+}
+
 export interface PostmanCollection {
   info: PostmanInfo;
   variable: PostmanVariable[];
+  auth?: PostmanAuth;
   item: (PostmanFolder | PostmanRequestItem)[];
 }
 
@@ -51,9 +59,18 @@ export interface PostmanHeader {
   value: string;
 }
 
+export interface PostmanFormDataParam {
+  key: string;
+  value?: string;
+  type?: string; // "text" | "file"
+  src?: string;
+  description?: string;
+}
+
 export interface PostmanBody {
   mode: string;
-  raw: string;
+  raw?: string;
+  formdata?: PostmanFormDataParam[];
   options?: { raw?: { language?: string } };
 }
 
@@ -180,6 +197,8 @@ export interface FlatEndpoint {
   description?: string;
   headers: PostmanHeader[];
   body?: string;
+  bodyObj?: PostmanBody;
   parameters?: ApiParameter[];
+  queryParams?: { key: string; value: string; description?: string }[];
   responses: PostmanResponse[];
 }

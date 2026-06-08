@@ -1,5 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import { readFile } from "fs/promises";
 import { parseContent, flattenCollection, getFolderTree } from "./parser.js";
 import type { PostmanCollection, FlatEndpoint } from "./types.js";
 
@@ -9,6 +10,63 @@ interface SessionState {
   collection: PostmanCollection | null;
   endpoints: FlatEndpoint[];
   sourceUrl: string | null;
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────
+
+/** Resolve {{variable}} placeholders from collection variables */
+function resolveVariables(text: string, variables: { key: string; value: string }[]): string {
+  return text.replace(/\{\{(\w+)\}\}/g, (match, key) => {
+    const v = variables.find((vr) => vr.key === key);
+    return v ? v.value : match;
+  });
+}
+
+/** Infer a JSON-like schema table from an example value */
+function inferSchema(value: unknown, prefix = ""): string[] {
+  const lines: string[] = [];
+
+  if (value === null || value === undefined) return lines;
+
+  if (Array.isArray(value)) {
+    lines.push(`| ${prefix || "(root)"} | array | — | — |`);
+    if (value.length > 0) {
+      lines.push(...inferSchema(value[0], `${prefix}[]`));
+    }
+    return lines;
+  }
+
+  if (typeof value === "object") {
+    for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
+      const fieldPath = prefix ? `${prefix}.${key}` : key;
+      const type = val === null ? "null" : Array.isArray(val) ? "array" : typeof val;
+      const example = type === "object" || type === "array" ? "" : JSON.stringify(val);
+      lines.push(`| ${fieldPath} | ${type} | — | ${example} |`);
+      if (type === "object" && val !== null) {
+        lines.push(...inferSchema(val, fieldPath));
+      } else if (type === "array" && Array.isArray(val) && val.length > 0) {
+        lines.push(...inferSchema(val[0], `${fieldPath}[]`));
+      }
+    }
+  }
+
+  return lines;
+}
+
+/** Detect Postman Documenter URL and extract userId + slug */
+function parseDocumenterUrl(url: string): { userId: string; slug: string } | null {
+  const match = url.match(/documenter\.getpostman\.com\/view\/(\d+)\/([^/?#]+)/);
+  return match ? { userId: match[1], slug: match[2] } : null;
+}
+
+/** Provide a more specific error message for fetch failures */
+function describeFetchError(err: unknown): string {
+  const msg = err instanceof Error ? err.message : String(err);
+  if (msg.includes("ECONNREFUSED")) return `Connection refused — the server is not running or not reachable. (${msg})`;
+  if (msg.includes("ENOTFOUND") || msg.includes("getaddrinfo")) return `DNS lookup failed — could not resolve hostname. (${msg})`;
+  if (msg.includes("ETIMEDOUT") || msg.includes("timeout")) return `Request timed out. (${msg})`;
+  if (msg.includes("certificate") || msg.includes("SSL")) return `SSL/TLS error. (${msg})`;
+  return msg;
 }
 
 // ── Create a fresh MCP server instance (one per session for HTTP) ────────
@@ -29,26 +87,81 @@ export function createServer(): { server: McpServer; state: SessionState } {
 
   server.tool(
     "load_api_docs",
-    "Load API documentation from a URL. Supports Postman Collection JSON, OpenAPI 3.x JSON/YAML. Paste any raw URL to your API docs.",
+    "Load API documentation from a URL. Supports Postman Collection JSON, OpenAPI 3.x JSON/YAML, and Postman Documenter URLs.",
     {
-      url: z.string().describe("URL to the API documentation (Postman collection JSON URL, OpenAPI spec URL, raw GitHub URL, etc.)"),
+      url: z.string().describe("URL to the API documentation (Postman collection JSON URL, OpenAPI spec URL, Postman Documenter URL, raw GitHub URL, etc.)"),
     },
     async ({ url }) => {
       try {
-        const response = await fetch(url, {
-          headers: { Accept: "application/json, application/x-yaml, text/yaml, text/plain, */*" },
-        });
+        // Issue 2.1: Detect Postman Documenter URLs
+        const documenterInfo = parseDocumenterUrl(url);
+        let text: string;
+        let contentType: string;
 
-        if (!response.ok) {
-          return { content: [{ type: "text", text: `Failed to fetch: ${response.status} ${response.statusText}` }] };
+        if (documenterInfo) {
+          // Fetch collection JSON via Postman's gateway API
+          const gwUrl = `https://documenter.gw.postman.com/api/collections/${documenterInfo.userId}/${documenterInfo.slug}?segregateAuth=true&versionTag=latest`;
+          try {
+            const gwResponse = await fetch(gwUrl, {
+              headers: { Accept: "application/json" },
+            });
+            if (gwResponse.ok) {
+              text = await gwResponse.text();
+              contentType = gwResponse.headers.get("content-type") ?? "application/json";
+            } else {
+              return {
+                content: [{
+                  type: "text",
+                  text: [
+                    `Could not fetch collection from Postman Documenter URL (status ${gwResponse.status}).`,
+                    ``,
+                    gwResponse.status === 404
+                      ? `The collection may not exist, may have been deleted, or may be private.`
+                      : `Postman's API returned an unexpected error.`,
+                    ``,
+                    `**Workaround:** Export the collection as JSON from Postman and use \`load_api_docs_from_text\` (with file_path) instead.`,
+                  ].join("\n"),
+                }],
+              };
+            }
+          } catch (fetchErr) {
+            return {
+              content: [{
+                type: "text",
+                text: `Could not fetch collection from Postman Documenter URL: ${describeFetchError(fetchErr)}\n\n**Workaround:** Export the collection as JSON and use \`load_api_docs_from_text\` (with file_path) instead.`,
+              }],
+            };
+          }
+        } else {
+          const response = await fetch(url, {
+            headers: { Accept: "application/json, application/x-yaml, text/yaml, text/plain, */*" },
+          });
+
+          if (!response.ok) {
+            return { content: [{ type: "text", text: `Failed to fetch: ${response.status} ${response.statusText}` }] };
+          }
+
+          text = await response.text();
+          contentType = response.headers.get("content-type") ?? "";
         }
-
-        const text = await response.text();
-        const contentType = response.headers.get("content-type") ?? "";
 
         const collection = parseContent(text, contentType);
         if (!collection) {
-          return { content: [{ type: "text", text: "Could not parse the document. Supported formats: Postman Collection v2.1, OpenAPI 3.x (JSON/YAML)." }] };
+          // Issue 3.4: Better error messages
+          const isHtml = text.trimStart().startsWith("<!") || text.trimStart().startsWith("<html");
+          const preview = text.slice(0, 200).replace(/\n/g, " ");
+          let reason = "Unrecognized format.";
+          if (isHtml) {
+            reason = "Received HTML instead of JSON/YAML — this URL may be a web page rather than a raw API spec. Try finding the raw JSON/YAML URL.";
+          } else {
+            try { JSON.parse(text); reason = "Valid JSON but not a recognized Postman Collection or OpenAPI spec. Check that the JSON has 'info'+'item' (Postman) or 'openapi'+'paths' (OpenAPI)."; } catch { reason = "Content is not valid JSON or YAML."; }
+          }
+          return {
+            content: [{
+              type: "text",
+              text: `Could not parse the document.\n\n**Reason:** ${reason}\n**Content preview:** \`${preview}...\`\n\nSupported formats: Postman Collection v2.1, OpenAPI 3.x (JSON/YAML).`,
+            }],
+          };
         }
 
         state.collection = collection;
@@ -74,7 +187,7 @@ export function createServer(): { server: McpServer; state: SessionState } {
           }],
         };
       } catch (err) {
-        return { content: [{ type: "text", text: `Error loading docs: ${err instanceof Error ? err.message : String(err)}` }] };
+        return { content: [{ type: "text", text: `Error loading docs: ${describeFetchError(err)}` }] };
       }
     }
   );
@@ -83,13 +196,39 @@ export function createServer(): { server: McpServer; state: SessionState } {
 
   server.tool(
     "load_api_docs_from_text",
-    "Load API documentation from raw text content (paste the JSON/YAML directly instead of a URL).",
+    "Load API documentation from raw text content or a local file path.",
     {
-      content: z.string().describe("Raw Postman Collection JSON or OpenAPI 3.x JSON/YAML content"),
+      content: z.string().optional().describe("Raw Postman Collection JSON or OpenAPI 3.x JSON/YAML content"),
+      file_path: z.string().optional().describe("Path to a local JSON/YAML file containing the API docs"),
       format: z.enum(["json", "yaml"]).default("json").describe("Format of the content"),
     },
-    async ({ content, format }) => {
-      const collection = parseContent(content, format === "yaml" ? "application/yaml" : "application/json");
+    async ({ content, file_path, format }) => {
+      // Issue 2.2: Support file_path parameter
+      let rawContent: string;
+
+      if (file_path) {
+        try {
+          rawContent = await readFile(file_path, "utf-8");
+        } catch (err) {
+          return {
+            content: [{
+              type: "text",
+              text: `Could not read file: ${err instanceof Error ? err.message : String(err)}`,
+            }],
+          };
+        }
+      } else if (content) {
+        rawContent = content;
+      } else {
+        return {
+          content: [{
+            type: "text",
+            text: "Provide either `content` (raw JSON/YAML string) or `file_path` (path to a local file).",
+          }],
+        };
+      }
+
+      const collection = parseContent(rawContent, format === "yaml" ? "application/yaml" : "application/json");
       if (!collection) {
         return { content: [{ type: "text", text: "Could not parse the content. Supported formats: Postman Collection v2.1, OpenAPI 3.x (JSON/YAML)." }] };
       }
@@ -166,11 +305,13 @@ export function createServer(): { server: McpServer; state: SessionState } {
       }
 
       const q = query.toLowerCase();
+      // Issue 3.2: Also search individual folder path segments
       const matches = state.endpoints.filter(
         (e) =>
           e.name.toLowerCase().includes(q) ||
           e.url.toLowerCase().includes(q) ||
           e.folder.toLowerCase().includes(q) ||
+          e.id.toLowerCase().includes(q) ||
           (e.description?.toLowerCase().includes(q) ?? false)
       );
 
@@ -179,7 +320,7 @@ export function createServer(): { server: McpServer; state: SessionState } {
       }
 
       const lines = matches.map(
-        (e) => `[${e.method.padEnd(7)}] ${e.url}  —  ${e.name}`
+        (e) => `[${e.method.padEnd(7)}] ${e.url}  —  ${e.name}  (${e.folder})`
       );
 
       return {
@@ -244,8 +385,24 @@ export function createServer(): { server: McpServer; state: SessionState } {
         }
       }
 
+      // Issue 3.3: Show query params extracted from URL
+      if (match.queryParams && match.queryParams.length > 0) {
+        sections.push("", "**Query Parameters:**");
+        for (const qp of match.queryParams) {
+          const desc = qp.description ? `: ${qp.description}` : "";
+          const val = qp.value ? ` = \`${qp.value}\`` : "";
+          sections.push(`  - \`${qp.key}\`${val}${desc}`);
+        }
+      }
+
       if (match.body) {
         sections.push("", "**Request Body:**", "```json", match.body, "```");
+      } else if (match.bodyObj?.mode === "formdata" && match.bodyObj.formdata) {
+        sections.push("", "**Request Body (form-data):**");
+        for (const f of match.bodyObj.formdata) {
+          const type = f.type === "file" ? " [file]" : "";
+          sections.push(`  - \`${f.key}\`${type}: ${f.value || f.src || "(empty)"}`);
+        }
       }
 
       if (match.responses.length > 0) {
@@ -320,6 +477,10 @@ export function createServer(): { server: McpServer; state: SessionState } {
         .map((v) => `  {{${v.key}}} = ${v.value}`)
         .join("\n");
 
+      const authInfo = state.collection.auth
+        ? `Auth: ${state.collection.auth.type} (collection-level)`
+        : "";
+
       return {
         content: [{
           type: "text",
@@ -327,6 +488,7 @@ export function createServer(): { server: McpServer; state: SessionState } {
             `Name: ${state.collection.info.name}`,
             state.collection.info.description ? `Description: ${state.collection.info.description}` : "",
             state.sourceUrl ? `Source: ${state.sourceUrl}` : "",
+            authInfo,
             `Total endpoints: ${state.endpoints.length}`,
             "",
             `Methods:\n${methodSummary}`,
@@ -366,6 +528,10 @@ export function createServer(): { server: McpServer; state: SessionState } {
       }
 
       let url = match.url;
+      // Resolve collection variables first
+      if (state.collection.variable.length > 0) {
+        url = resolveVariables(url, state.collection.variable);
+      }
       url = url.replace(/\{\{baseUrl\}\}/g, base_url ?? "");
       url = url.replace(/\{\{[^}]+\}\}/g, "");
 
@@ -385,6 +551,14 @@ export function createServer(): { server: McpServer; state: SessionState } {
       const reqHeaders: Record<string, string> = {};
       for (const h of match.headers) {
         reqHeaders[h.key] = h.value;
+      }
+      // Add collection-level auth header
+      if (state.collection.auth?.type === "bearer" && state.collection.auth.bearer) {
+        const tokenEntry = state.collection.auth.bearer.find((b) => b.key === "token");
+        if (tokenEntry) {
+          const tokenValue = resolveVariables(tokenEntry.value, state.collection.variable);
+          reqHeaders["Authorization"] = `Bearer ${tokenValue}`;
+        }
       }
       if (extraHeaders) {
         Object.assign(reqHeaders, extraHeaders);
@@ -444,10 +618,11 @@ export function createServer(): { server: McpServer; state: SessionState } {
         };
       } catch (err) {
         const elapsed = Date.now() - start;
+        // Issue 3.4: Better error messages
         return {
           content: [{
             type: "text",
-            text: `Request failed after ${elapsed}ms: ${err instanceof Error ? err.message : String(err)}`,
+            text: `Request failed after ${elapsed}ms: ${describeFetchError(err)}`,
           }],
         };
       }
@@ -480,7 +655,13 @@ export function createServer(): { server: McpServer; state: SessionState } {
         return { content: [{ type: "text", text: `No endpoint found matching "${name}".` }] };
       }
 
+      const variables = state.collection.variable ?? [];
+
       let url = match.url;
+      // Issue 2.6: Resolve {{variables}} from collection variables
+      if (variables.length > 0) {
+        url = resolveVariables(url, variables);
+      }
       url = url.replace(/\{\{baseUrl\}\}/g, base_url ?? "{{baseUrl}}");
 
       if (!url.startsWith("http") && base_url) {
@@ -488,11 +669,41 @@ export function createServer(): { server: McpServer; state: SessionState } {
       }
 
       const parts = [`curl -X ${match.method} '${url}'`];
+
+      // Existing endpoint headers
       for (const h of match.headers) {
-        parts.push(`  -H '${h.key}: ${h.value}'`);
+        let headerValue = h.value;
+        if (variables.length > 0) headerValue = resolveVariables(headerValue, variables);
+        parts.push(`  -H '${h.key}: ${headerValue}'`);
       }
-      if (match.body && !["GET", "HEAD"].includes(match.method)) {
-        parts.push(`  -d '${match.body.replace(/'/g, "'\\''")}'`);
+
+      // Issue 2.4: Include collection-level auth header
+      const hasAuthHeader = match.headers.some((h) => h.key.toLowerCase() === "authorization");
+      if (!hasAuthHeader && state.collection.auth?.type === "bearer" && state.collection.auth.bearer) {
+        const tokenEntry = state.collection.auth.bearer.find((b) => b.key === "token");
+        if (tokenEntry) {
+          let tokenValue = tokenEntry.value;
+          if (variables.length > 0) tokenValue = resolveVariables(tokenValue, variables);
+          parts.push(`  -H 'Authorization: Bearer ${tokenValue}'`);
+        }
+      }
+
+      // Issue 2.4: Handle formdata bodies
+      if (match.bodyObj?.mode === "formdata" && match.bodyObj.formdata) {
+        for (const field of match.bodyObj.formdata) {
+          if (field.type === "file") {
+            parts.push(`  -F '${field.key}=@${field.src || "/path/to/file"}'`);
+          } else {
+            let val = field.value ?? "";
+            if (variables.length > 0) val = resolveVariables(val, variables);
+            parts.push(`  -F '${field.key}=${val}'`);
+          }
+        }
+      } else if (match.body && !["GET", "HEAD"].includes(match.method)) {
+        let bodyStr = match.body;
+        // Issue 2.6: Resolve variables in body
+        if (variables.length > 0) bodyStr = resolveVariables(bodyStr, variables);
+        parts.push(`  -d '${bodyStr.replace(/'/g, "'\\''")}'`);
       }
 
       return {
@@ -508,7 +719,7 @@ export function createServer(): { server: McpServer; state: SessionState } {
 
   server.tool(
     "get_request_body_schema",
-    "Get the request body example/schema for a specific endpoint.",
+    "Get the request body schema (inferred from example) for a specific endpoint.",
     {
       name: z.string().describe("Endpoint name or URL substring to match"),
     },
@@ -529,15 +740,54 @@ export function createServer(): { server: McpServer; state: SessionState } {
         return { content: [{ type: "text", text: `No endpoint found matching "${name}".` }] };
       }
 
+      // Handle formdata bodies
+      if (match.bodyObj?.mode === "formdata" && match.bodyObj.formdata) {
+        const lines = [
+          `## Request Body Schema: ${match.method} ${match.name}`,
+          "",
+          "**Content-Type:** multipart/form-data",
+          "",
+          "| Field | Type | Value |",
+          "|-------|------|-------|",
+        ];
+        for (const f of match.bodyObj.formdata) {
+          const type = f.type === "file" ? "file" : "text";
+          lines.push(`| ${f.key} | ${type} | ${f.value || f.src || ""} |`);
+        }
+        return { content: [{ type: "text", text: lines.join("\n") }] };
+      }
+
       if (!match.body) {
         return { content: [{ type: "text", text: `${match.method} ${match.name} has no request body.` }] };
       }
 
+      // Issue 2.5: Infer schema types from example JSON
+      const sections = [
+        `## Request Body Schema: ${match.method} ${match.name}`,
+      ];
+
+      try {
+        const parsed = JSON.parse(match.body);
+        const schemaLines = inferSchema(parsed);
+
+        if (schemaLines.length > 0) {
+          sections.push(
+            "",
+            "**Inferred Schema:**",
+            "",
+            "| Field | Type | Required | Example |",
+            "|-------|------|----------|---------|",
+            ...schemaLines,
+          );
+        }
+      } catch {
+        // Not valid JSON, just show raw
+      }
+
+      sections.push("", "**Example:**", "", "```json", match.body, "```");
+
       return {
-        content: [{
-          type: "text",
-          text: `## Request Body: ${match.method} ${match.name}\n\n\`\`\`json\n${match.body}\n\`\`\``,
-        }],
+        content: [{ type: "text", text: sections.join("\n") }],
       };
     }
   );
@@ -567,7 +817,21 @@ export function createServer(): { server: McpServer; state: SessionState } {
         return { content: [{ type: "text", text: `No endpoint found matching "${name}".` }] };
       }
 
+      // Issue 2.3: Better messaging when responses are empty
       if (match.responses.length === 0) {
+        const hasAnyResponses = state.endpoints.some((e) => e.responses.length > 0);
+        if (!hasAnyResponses) {
+          return {
+            content: [{
+              type: "text",
+              text: [
+                `${match.method} ${match.name} has no response examples.`,
+                "",
+                "**Note:** No endpoints in this collection have response examples. Response data may have been stripped when loading the collection (e.g., to reduce size for `load_api_docs_from_text`). Try reloading the full collection with `load_api_docs` or `load_api_docs_from_text` with `file_path` to include responses.",
+              ].join("\n"),
+            }],
+          };
+        }
         return { content: [{ type: "text", text: `${match.method} ${match.name} has no response examples.` }] };
       }
 
