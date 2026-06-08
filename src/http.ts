@@ -2,7 +2,9 @@
 
 import express from "express";
 import cors from "cors";
+import crypto from "crypto";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createServer } from "./server.js";
 import {
   isAuthEnabled,
@@ -23,8 +25,9 @@ app.use(express.urlencoded({ extended: true }));
 
 const BASE_URL = process.env.BASE_URL || "https://dockly-mcp.up.railway.app";
 
-// Track active sessions: sessionId -> transport
-const sessions = new Map<string, SSEServerTransport>();
+// Track active sessions
+const sseSessions = new Map<string, SSEServerTransport>();
+const streamableSessions = new Map<string, { transport: StreamableHTTPServerTransport; server: ReturnType<typeof createServer>["server"] }>();
 
 // ── OAuth Discovery (MCP spec) ───────────────────────────────────────────
 
@@ -168,10 +171,11 @@ app.get("/", (_req, res) => {
     version: "1.0.0",
     status: "running",
     auth: isAuthEnabled() ? "github-oauth" : "disabled",
-    activeSessions: sessions.size,
+    activeSessions: sseSessions.size + streamableSessions.size,
     endpoints: {
-      sse: "GET /sse",
-      messages: "POST /messages?sessionId=<id>",
+      mcp: "POST /mcp (Streamable HTTP)",
+      sse: "GET /sse (legacy SSE)",
+      messages: "POST /messages?sessionId=<id> (legacy SSE)",
     },
   });
 });
@@ -180,32 +184,92 @@ app.get("/health", (_req, res) => {
   res.json({ status: "ok" });
 });
 
-// ── SSE endpoint ─────────────────────────────────────────────────────────
+// ── Streamable HTTP endpoint (what Claude.ai uses) ───────────────────────
+
+app.post("/mcp", async (req, res) => {
+  if (!requireAuth(req, res)) return;
+
+  const sessionId = req.headers["mcp-session-id"] as string | undefined;
+
+  // Existing session
+  if (sessionId && streamableSessions.has(sessionId)) {
+    const session = streamableSessions.get(sessionId)!;
+    await session.transport.handleRequest(req, res, req.body);
+    return;
+  }
+
+  // New session (initialization)
+  const { server } = createServer();
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: () => crypto.randomUUID(),
+  });
+
+  transport.onclose = () => {
+    const sid = transport.sessionId;
+    if (sid) {
+      console.log(`[MCP] Session closed: ${sid}`);
+      streamableSessions.delete(sid);
+    }
+  };
+
+  await server.connect(transport);
+  await transport.handleRequest(req, res, req.body);
+
+  if (transport.sessionId) {
+    console.log(`[MCP] New session: ${transport.sessionId}`);
+    streamableSessions.set(transport.sessionId, { transport, server });
+  }
+});
+
+app.get("/mcp", async (req, res) => {
+  if (!requireAuth(req, res)) return;
+
+  const sessionId = req.headers["mcp-session-id"] as string | undefined;
+  if (sessionId && streamableSessions.has(sessionId)) {
+    const session = streamableSessions.get(sessionId)!;
+    await session.transport.handleRequest(req, res);
+    return;
+  }
+
+  res.status(400).json({ error: "Missing or invalid session. Send POST /mcp first to initialize." });
+});
+
+app.delete("/mcp", async (req, res) => {
+  const sessionId = req.headers["mcp-session-id"] as string | undefined;
+  if (sessionId && streamableSessions.has(sessionId)) {
+    const session = streamableSessions.get(sessionId)!;
+    await session.transport.handleRequest(req, res);
+    streamableSessions.delete(sessionId);
+    console.log(`[MCP] Session deleted: ${sessionId}`);
+    return;
+  }
+  res.status(404).json({ error: "Session not found." });
+});
+
+// ── Legacy SSE endpoint (for Claude Code, Cursor, etc.) ──────────────────
 
 app.get("/sse", async (req, res) => {
   if (!requireAuth(req, res)) return;
 
   const { server } = createServer();
   const transport = new SSEServerTransport("/messages", res);
-  sessions.set(transport.sessionId, transport);
+  sseSessions.set(transport.sessionId, transport);
 
   console.log(`[SSE] New session: ${transport.sessionId}`);
 
   req.on("close", () => {
     console.log(`[SSE] Session closed: ${transport.sessionId}`);
-    sessions.delete(transport.sessionId);
+    sseSessions.delete(transport.sessionId);
   });
 
   await server.connect(transport);
 });
 
-// ── Messages endpoint ────────────────────────────────────────────────────
-
 app.post("/messages", async (req, res) => {
   if (!requireAuth(req, res)) return;
 
   const sessionId = req.query.sessionId as string;
-  const transport = sessions.get(sessionId);
+  const transport = sseSessions.get(sessionId);
 
   if (!transport) {
     res.status(404).json({ error: "Session not found. Connect to /sse first." });
@@ -229,6 +293,7 @@ app.listen(PORT, "0.0.0.0", () => {
   ║         dockly-mcp server (HTTP/SSE)         ║
   ╠══════════════════════════════════════════════╣
   ║  Local:   http://localhost:${PORT}              ║
+  ║  MCP:     http://localhost:${PORT}/mcp           ║
   ║  SSE:     http://localhost:${PORT}/sse           ║
   ║  Health:  http://localhost:${PORT}/health        ║
   ╚══════════════════════════════════════════════╝
