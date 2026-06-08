@@ -1,5 +1,5 @@
 {
-  "name": "api-docs-mcp-server",
+  "name": "dockly-mcp",
   "version": "1.0.0",
   "description": "MCP server that fetches and parses API documentation from Postman/OpenAPI URLs",
   "type": "module",

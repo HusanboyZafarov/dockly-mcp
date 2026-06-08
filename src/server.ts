@@ -21,7 +21,7 @@ export function createServer(): { server: McpServer; state: SessionState } {
   };
 
   const server = new McpServer({
-    name: "api-docs-mcp",
+    name: "dockly-mcp",
     version: "1.0.0",
   });
 
